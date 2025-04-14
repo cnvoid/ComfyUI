@@ -1,3 +1,4 @@
+# main.py (Modified)
 import comfy.options
 comfy.options.enable_args_parsing()
 
@@ -10,16 +11,63 @@ from app.logger import setup_logger
 import itertools
 import utils.extra_config
 import logging
+import sys
+import threading # <-- Import threading
+import uvicorn   # <-- Import uvicorn
 
-if __name__ == "__main__":
-    #NOTE: These do not do anything on core ComfyUI which should already have no communication with the internet, they are for custom nodes.
-    os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
-    os.environ['DO_NOT_TRACK'] = '1'
+# --- FastAPI App Import ---
+try:
+    # Assuming your FastAPI app instance is named 'app' in this file
+    from api_server.fastapi.server import app as fastapi_app
+except ImportError as e:
+    print(f"Error importing FastAPI app: {e}")
+    print("Please ensure api_server/fastapi/server.py exists and contains an 'app' instance.")
+    sys.exit(1)
+# --- End FastAPI App Import ---
 
+# --- Original ComfyUI Imports and Setup ---
+import cuda_malloc
+import comfy.utils
+import execution
+import server
+from server import BinaryEventTypes
+import nodes
+import comfy.model_management
+import comfyui_version
+import app.logger
+# --- End Original ComfyUI Imports and Setup ---
+
+
+# --- Environment Setup ---
+# NOTE: These do not do anything on core ComfyUI which should already have no communication with the internet, they are for custom nodes.
+os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
+os.environ['DO_NOT_TRACK'] = '1'
 
 setup_logger(log_level=args.verbose, use_stdout=args.log_stdout)
+# --- End Environment Setup ---
 
+
+# --- FastAPI Server Function ---
+def run_fastapi_server():
+    """
+    Runs the FastAPI Uvicorn server.
+    """
+    print("Starting FastAPI server via Uvicorn on port 8000...")
+    try:
+        config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=8000, log_level="info")
+        server = uvicorn.Server(config)
+        # Uvicorn's server.run() is blocking and needs to be run in the event loop
+        # managed by the thread. We'll run it directly here.
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=8000, log_level="info")
+    except Exception as e:
+        logging.error(f"FastAPI server failed: {e}")
+        logging.error(traceback.format_exc())
+# --- End FastAPI Server Function ---
+
+
+# --- ComfyUI Helper Functions (Keep original functions) ---
 def apply_custom_paths():
+    # (Keep the original function content)
     # extra model paths
     extra_model_paths_config_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "extra_model_paths.yaml")
     if os.path.isfile(extra_model_paths_config_path):
@@ -55,6 +103,7 @@ def apply_custom_paths():
 
 
 def execute_prestartup_script():
+    # (Keep the original function content)
     def execute_script(script_path):
         module_name = os.path.splitext(script_path)[0]
         try:
@@ -97,51 +146,15 @@ def execute_prestartup_script():
 apply_custom_paths()
 execute_prestartup_script()
 
-
-# Main code
+# --- Main ComfyUI Code (Keep original functions) ---
 import asyncio
 import shutil
-import threading
 import gc
-
 
 if os.name == "nt":
     logging.getLogger("xformers").addFilter(lambda record: 'A matching Triton is not available' not in record.getMessage())
 
-if __name__ == "__main__":
-    if args.cuda_device is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
-        os.environ['HIP_VISIBLE_DEVICES'] = str(args.cuda_device)
-        logging.info("Set cuda device to: {}".format(args.cuda_device))
-
-    if args.oneapi_device_selector is not None:
-        os.environ['ONEAPI_DEVICE_SELECTOR'] = args.oneapi_device_selector
-        logging.info("Set oneapi device selector to: {}".format(args.oneapi_device_selector))
-
-    if args.deterministic:
-        if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
-            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
-
-    import cuda_malloc
-
-if args.windows_standalone_build:
-    try:
-        from fix_torch import fix_pytorch_libomp
-        fix_pytorch_libomp()
-    except:
-        pass
-
-import comfy.utils
-
-import execution
-import server
-from server import BinaryEventTypes
-import nodes
-import comfy.model_management
-import comfyui_version
-import app.logger
-
-
+# (Keep cuda_malloc_warning, prompt_worker, run, hijack_progress, cleanup_temp functions as they are)
 def cuda_malloc_warning():
     device = comfy.model_management.get_torch_device()
     device_name = comfy.model_management.get_torch_device_name(device)
@@ -236,12 +249,13 @@ def cleanup_temp():
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-
-def start_comfyui(asyncio_loop=None):
+# --- Modified start_comfyui to run in a thread ---
+def run_comfyui_server():
     """
-    Starts the ComfyUI server using the provided asyncio event loop or creates a new one.
-    Returns the event loop, server instance, and a function to start the server asynchronously.
+    Initializes and starts the main ComfyUI server components.
+    This function now contains the logic previously in start_comfyui and the main block.
     """
+    logging.info("Starting ComfyUI server...")
     if args.temp_directory:
         temp_dir = os.path.join(os.path.abspath(args.temp_directory), "temp")
         logging.info(f"Setting temp directory to: {temp_dir}")
@@ -255,10 +269,14 @@ def start_comfyui(asyncio_loop=None):
         except:
             pass
 
-    if not asyncio_loop:
-        asyncio_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(asyncio_loop)
-    prompt_server = server.PromptServer(asyncio_loop)
+    # Get or create event loop for this thread
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    prompt_server = server.PromptServer(loop)
     q = execution.PromptQueue(prompt_server)
 
     nodes.init_extra_nodes(init_custom_nodes=not args.disable_all_custom_nodes)
@@ -271,7 +289,9 @@ def start_comfyui(asyncio_loop=None):
     threading.Thread(target=prompt_worker, daemon=True, args=(q, prompt_server,)).start()
 
     if args.quick_test_for_ci:
-        exit(0)
+        logging.info("Quick test mode enabled. Exiting.")
+        # In a real scenario, might need a cleaner way to signal exit if needed.
+        return # Exit this thread if quick test
 
     os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
     call_on_start = None
@@ -289,20 +309,75 @@ def start_comfyui(asyncio_loop=None):
         await prompt_server.setup()
         await run(prompt_server, address=args.listen, port=args.port, verbose=not args.dont_print_server, call_on_start=call_on_start)
 
-    # Returning these so that other code can integrate with the ComfyUI loop and server
-    return asyncio_loop, prompt_server, start_all
+    try:
+        logging.info("Starting ComfyUI server in thread...")
+        app.logger.print_startup_warnings()
+        loop.run_until_complete(start_all())
+    except KeyboardInterrupt:
+        logging.info("\nComfyUI server thread stopped.")
+    finally:
+        cleanup_temp()
+        loop.close()
+        logging.info("ComfyUI server thread finished.")
 
-
+# --- Main Execution Block ---
 if __name__ == "__main__":
-    # Running directly, just start ComfyUI.
     logging.info("ComfyUI version: {}".format(comfyui_version.__version__))
 
-    event_loop, _, start_all_func = start_comfyui()
-    try:
-        x = start_all_func()
-        app.logger.print_startup_warnings()
-        event_loop.run_until_complete(x)
-    except KeyboardInterrupt:
-        logging.info("\nStopped server")
+    # --- Device and Deterministic Setup (Keep original) ---
+    if args.cuda_device is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
+        os.environ['HIP_VISIBLE_DEVICES'] = str(args.cuda_device)
+        logging.info("Set cuda device to: {}".format(args.cuda_device))
 
+    if args.oneapi_device_selector is not None:
+        os.environ['ONEAPI_DEVICE_SELECTOR'] = args.oneapi_device_selector
+        logging.info("Set oneapi device selector to: {}".format(args.oneapi_device_selector))
+
+    if args.deterministic:
+        if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
+            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
+
+    if args.windows_standalone_build:
+        try:
+            from fix_torch import fix_pytorch_libomp
+            fix_pytorch_libomp()
+        except:
+            pass
+    # --- End Device and Deterministic Setup ---
+
+
+    # --- Start Servers in Threads ---
+    print("Main process starting...")
+
+    # 1. Create thread for ComfyUI server
+    comfyui_server_thread = threading.Thread(target=run_comfyui_server, daemon=True)
+
+    # 2. Create thread for FastAPI server
+    fastapi_server_thread = threading.Thread(target=run_fastapi_server, daemon=True)
+
+    # 3. Start threads
+    print("Starting ComfyUI server thread...")
+    comfyui_server_thread.start()
+
+    print("Starting FastAPI server thread...")
+    fastapi_server_thread.start()
+
+    # 4. Keep main thread alive
+    try:
+        while True:
+            time.sleep(1)
+            if not comfyui_server_thread.is_alive():
+                logging.warning("ComfyUI server thread seems to have stopped unexpectedly.")
+                break
+            if not fastapi_server_thread.is_alive():
+                logging.warning("FastAPI server thread seems to have stopped unexpectedly.")
+                break
+    except KeyboardInterrupt:
+        print("\nCtrl+C received in main thread. Shutting down...")
+        # Threads are daemons, they will exit when the main thread exits.
+        # Add any specific cleanup needed for the main thread if necessary.
+
+    print("Main process finished.")
+    # Ensure temp cleanup happens on exit if threads didn't handle it
     cleanup_temp()
